@@ -1,4 +1,5 @@
 use crate::address_map::get_function_address_map;
+use crate::machine::CodegenError;
 use crate::{
     common_decl::*, config::Singlepass, emitter_x64::*, location::CombinedRegister,
     machine::MachineSpecific, machine_x64::Machine, x64_decl::*,
@@ -237,11 +238,6 @@ pub enum IfElseState {
     Else,
 }
 
-#[derive(Debug)]
-pub struct CodegenError {
-    pub message: String,
-}
-
 /// Abstraction for a 2-input, 1-output operator. Can be an integer/floating-point
 /// binop/cmpop.
 struct I2O1 {
@@ -299,19 +295,11 @@ impl<'a> FuncGen<'a> {
     }
 
     /// Marks each address in the code range emitted by `f` with the trap code `code`.
-    fn mark_range_with_trap_code<F: FnOnce(&mut Self) -> R, R>(
-        &mut self,
-        code: TrapCode,
-        f: F,
-    ) -> R {
-        let begin = self.machine.assembler_get_offset().0;
-        let ret = f(self);
-        let end = self.machine.assembler_get_offset().0;
+    fn mark_address_range_with_trap_code(&mut self, code: TrapCode, begin: usize, end: usize) {
         for i in begin..end {
             self.trap_table.offset_to_code.insert(i, code);
         }
         self.mark_instruction_address_end(begin);
-        ret
     }
 
     /// Marks one address as trappable with trap code `code`.
@@ -1409,7 +1397,7 @@ impl<'a> FuncGen<'a> {
     }
 
     /// Emits a memory operation.
-    fn emit_memory_op<F: FnOnce(&mut Self, GPR) -> Result<(), CodegenError>>(
+    fn memory_op<F: FnOnce(&mut Self, GPR) -> Result<(), CodegenError>>(
         &mut self,
         addr: Location,
         memarg: &MemoryImmediate,
@@ -1421,121 +1409,30 @@ impl<'a> FuncGen<'a> {
             MemoryStyle::Static { .. } => false,
             MemoryStyle::Dynamic { .. } => true,
         };
-        let tmp_addr = self.machine.acquire_temp_gpr().unwrap();
 
-        // Reusing `tmp_addr` for temporary indirection here, since it's not used before the last reference to `{base,bound}_loc`.
-        let (base_loc, bound_loc) = if self.module.num_imported_memories != 0 {
-            // Imported memories require one level of indirection.
-            let offset = self
-                .vmoffsets
-                .vmctx_vmmemory_import_definition(MemoryIndex::new(0));
-            self.machine.specific.move_location(
-                Size::S64,
-                Location::Memory(Machine::get_vmctx_reg(), offset as i32),
-                Location::GPR(tmp_addr),
-            );
-            (Location::Memory(tmp_addr, 0), Location::Memory(tmp_addr, 8))
+        let offset = if self.module.num_imported_memories != 0 {
+            self.vmoffsets
+                .vmctx_vmmemory_import_definition(MemoryIndex::new(0))
         } else {
-            let offset = self
-                .vmoffsets
-                .vmctx_vmmemory_definition(LocalMemoryIndex::new(0));
-            (
-                Location::Memory(Machine::get_vmctx_reg(), offset as i32),
-                Location::Memory(Machine::get_vmctx_reg(), (offset + 8) as i32),
-            )
+            self.vmoffsets
+                .vmctx_vmmemory_definition(LocalMemoryIndex::new(0))
         };
-
-        let tmp_base = self.machine.acquire_temp_gpr().unwrap();
-        let tmp_bound = self.machine.acquire_temp_gpr().unwrap();
-
-        // Load base into temporary register.
-        self.machine
-            .specific
-            .move_location(Size::S64, base_loc, Location::GPR(tmp_base));
-
-        // Load bound into temporary register, if needed.
-        if need_check {
-            self.machine
-                .specific
-                .move_location(Size::S64, bound_loc, Location::GPR(tmp_bound));
-
-            // Wasm -> Effective.
-            // Assuming we never underflow - should always be true on Linux/macOS and Windows >=8,
-            // since the first page from 0x0 to 0x1000 is not accepted by mmap.
-
-            // This `lea` calculates the upper bound allowed for the beginning of the word.
-            // Since the upper bound of the memory is (exclusively) `tmp_bound + tmp_base`,
-            // the maximum allowed beginning of word is (inclusively)
-            // `tmp_bound + tmp_base - value_size`.
-            self.machine.specific.location_address(
-                Size::S64,
-                Location::Memory2(tmp_bound, tmp_base, Multiplier::One, -(value_size as i32)),
-                Location::GPR(tmp_bound),
-            );
-        }
-
-        // Load effective address.
-        // `base_loc` and `bound_loc` becomes INVALID after this line, because `tmp_addr`
-        // might be reused.
-        self.machine
-            .specific
-            .move_location(Size::S32, addr, Location::GPR(tmp_addr));
-
-        // Add offset to memory address.
-        if memarg.offset != 0 {
-            self.machine.specific.location_add(
-                Size::S32,
-                Location::Imm32(memarg.offset),
-                Location::GPR(tmp_addr),
-                true,
-            );
-
-            // Trap if offset calculation overflowed.
-            self.machine
-                .specific
-                .jmp_on_overflow(self.special_labels.heap_access_oob);
-        }
-
-        // Wasm linear memory -> real memory
-        self.machine.specific.location_add(
-            Size::S64,
-            Location::GPR(tmp_base),
-            Location::GPR(tmp_addr),
-            false,
+        let tmp_addr = self.machine.specific.pick_temp_gpr().unwrap();
+        let begin = self.machine.specific.memory_op_begin(
+            addr,
+            memarg,
+            check_alignment,
+            value_size,
+            need_check,
+            self.module.num_imported_memories != 0,
+            offset as i32,
+            self.special_labels.heap_access_oob,
+            tmp_addr,
         );
+        cb(self, tmp_addr)?;
+        let end = self.machine.specific.memory_op_end(tmp_addr);
 
-        if need_check {
-            // Trap if the end address of the requested area is above that of the linear memory.
-            self.machine.specific.location_cmp(
-                Size::S64,
-                Location::GPR(tmp_bound),
-                Location::GPR(tmp_addr),
-            );
-
-            // `tmp_bound` is inclusive. So trap only if `tmp_addr > tmp_bound`.
-            self.machine
-                .specific
-                .jmp_on_above(self.special_labels.heap_access_oob);
-        }
-
-        self.machine.release_temp_gpr(tmp_bound);
-        self.machine.release_temp_gpr(tmp_base);
-
-        let align = memarg.align;
-        if check_alignment && align != 1 {
-            self.machine.specific.location_test(
-                Size::S32,
-                Location::Imm32((align - 1).into()),
-                Location::GPR(tmp_addr),
-            );
-            self.machine
-                .specific
-                .jmp_on_different(self.special_labels.heap_access_oob);
-        }
-
-        self.mark_range_with_trap_code(TrapCode::HeapAccessOutOfBounds, |this| cb(this, tmp_addr))?;
-
-        self.machine.release_temp_gpr(tmp_addr);
+        self.mark_address_range_with_trap_code(TrapCode::HeapAccessOutOfBounds, begin, end);
         Ok(())
     }
 
@@ -1575,24 +1472,15 @@ impl<'a> FuncGen<'a> {
         let retry = self.machine.specific.assembler.get_label();
         self.machine.specific.emit_label(retry);
 
-        self.emit_memory_op(target, memarg, true, value_size, |this, addr| {
-            // Memory moves with size < 32b do not zero upper bits.
-            if memory_sz < Size::S32 {
-                this.machine.specific.assembler.emit_xor(
-                    Size::S32,
-                    Location::GPR(compare),
-                    Location::GPR(compare),
-                );
-            }
-            this.machine.specific.assembler.emit_mov(
+        self.memory_op(target, memarg, true, value_size, |this, addr| {
+            this.machine.specific.load_address(
                 memory_sz,
-                Location::Memory(addr, 0),
                 Location::GPR(compare),
+                Location::Memory(addr, 0),
             );
             this.machine
                 .specific
-                .assembler
-                .emit_mov(stack_sz, Location::GPR(compare), ret);
+                .move_location(stack_sz, Location::GPR(compare), ret);
             cb(this, compare, value);
             this.machine.specific.assembler.emit_lock_cmpxchg(
                 memory_sz,
@@ -1602,10 +1490,7 @@ impl<'a> FuncGen<'a> {
             Ok(())
         })?;
 
-        self.machine
-            .specific
-            .assembler
-            .emit_jmp(Condition::NotEqual, retry);
+        self.machine.specific.jmp_on_different(retry);
 
         self.machine
             .specific
@@ -7064,7 +6949,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 4, |this, addr| {
+                self.memory_op(target, memarg, false, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S32,
@@ -7084,7 +6969,7 @@ impl<'a> FuncGen<'a> {
                 self.fp_stack
                     .push(FloatValue::new(self.value_stack.len() - 1));
 
-                self.emit_memory_op(target, memarg, false, 4, |this, addr| {
+                self.memory_op(target, memarg, false, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S32,
@@ -7102,7 +6987,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 1, |this, addr| {
+                self.memory_op(target, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S8,
@@ -7121,7 +7006,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 1, |this, addr| {
+                self.memory_op(target, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movsx,
                         Size::S8,
@@ -7140,7 +7025,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 2, |this, addr| {
+                self.memory_op(target, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S16,
@@ -7159,7 +7044,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 2, |this, addr| {
+                self.memory_op(target, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movsx,
                         Size::S16,
@@ -7174,7 +7059,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 4, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S32,
@@ -7190,7 +7075,7 @@ impl<'a> FuncGen<'a> {
                 let fp = self.fp_stack.pop1()?;
                 let config_nan_canonicalization = self.config.enable_nan_canonicalization;
 
-                self.emit_memory_op(target_addr, memarg, false, 4, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 4, |this, addr| {
                     if !this
                         .machine
                         .specific
@@ -7216,7 +7101,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 1, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S8,
@@ -7230,7 +7115,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 2, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S16,
@@ -7248,7 +7133,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 8, |this, addr| {
+                self.memory_op(target, memarg, false, 8, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S64,
@@ -7268,7 +7153,7 @@ impl<'a> FuncGen<'a> {
                 self.fp_stack
                     .push(FloatValue::new(self.value_stack.len() - 1));
 
-                self.emit_memory_op(target, memarg, false, 8, |this, addr| {
+                self.memory_op(target, memarg, false, 8, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S64,
@@ -7286,7 +7171,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 1, |this, addr| {
+                self.memory_op(target, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S8,
@@ -7305,7 +7190,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 1, |this, addr| {
+                self.memory_op(target, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movsx,
                         Size::S8,
@@ -7324,7 +7209,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 2, |this, addr| {
+                self.memory_op(target, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S16,
@@ -7343,7 +7228,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 2, |this, addr| {
+                self.memory_op(target, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movsx,
                         Size::S16,
@@ -7362,7 +7247,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 4, |this, addr| {
+                self.memory_op(target, memarg, false, 4, |this, addr| {
                     match ret {
                         Location::GPR(_) => {}
                         Location::Memory(base, offset) => {
@@ -7395,7 +7280,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, false, 4, |this, addr| {
+                self.memory_op(target, memarg, false, 4, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movsx,
                         Size::S32,
@@ -7410,7 +7295,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 8, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 8, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S64,
@@ -7426,7 +7311,7 @@ impl<'a> FuncGen<'a> {
                 let fp = self.fp_stack.pop1()?;
                 let config_nan_canonicalization = self.config.enable_nan_canonicalization;
 
-                self.emit_memory_op(target_addr, memarg, false, 8, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 8, |this, addr| {
                     if !this
                         .machine
                         .specific
@@ -7451,7 +7336,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 1, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 1, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S8,
@@ -7465,7 +7350,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 2, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 2, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S16,
@@ -7479,7 +7364,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, false, 4, |this, addr| {
+                self.memory_op(target_addr, memarg, false, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S32,
@@ -7986,7 +7871,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S32,
@@ -8004,7 +7889,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S8,
@@ -8023,7 +7908,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S16,
@@ -8038,7 +7923,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 4, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S32,
@@ -8052,7 +7937,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 1, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 1, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S8,
@@ -8066,7 +7951,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 2, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 2, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S16,
@@ -8084,7 +7969,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 8, |this, addr| {
+                self.memory_op(target, memarg, true, 8, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_mov,
                         Size::S64,
@@ -8102,7 +7987,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S8,
@@ -8121,7 +8006,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.emit_relaxed_zx_sx(
                         Assembler::emit_movzx,
                         Size::S16,
@@ -8140,7 +8025,7 @@ impl<'a> FuncGen<'a> {
                 )[0];
                 self.value_stack.push(ret);
 
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     match ret {
                         Location::GPR(_) => {}
                         Location::Memory(base, offset) => {
@@ -8169,7 +8054,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 8, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 8, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S64,
@@ -8183,7 +8068,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 1, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 1, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S8,
@@ -8197,7 +8082,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 2, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 2, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S16,
@@ -8211,7 +8096,7 @@ impl<'a> FuncGen<'a> {
                 let target_value = self.pop_value_released();
                 let target_addr = self.pop_value_released();
 
-                self.emit_memory_op(target_addr, memarg, true, 4, |this, addr| {
+                self.memory_op(target_addr, memarg, true, 4, |this, addr| {
                     this.emit_relaxed_binop(
                         Assembler::emit_xchg,
                         Size::S32,
@@ -8235,7 +8120,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_mov(Size::S32, loc, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S32,
                         Location::GPR(value),
@@ -8263,7 +8148,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_mov(Size::S64, loc, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 8, |this, addr| {
+                self.memory_op(target, memarg, true, 8, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S64,
                         Location::GPR(value),
@@ -8293,7 +8178,7 @@ impl<'a> FuncGen<'a> {
                     Size::S32,
                     Location::GPR(value),
                 );
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S8,
                         Location::GPR(value),
@@ -8323,7 +8208,7 @@ impl<'a> FuncGen<'a> {
                     Size::S32,
                     Location::GPR(value),
                 );
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S16,
                         Location::GPR(value),
@@ -8353,7 +8238,7 @@ impl<'a> FuncGen<'a> {
                     Size::S64,
                     Location::GPR(value),
                 );
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S8,
                         Location::GPR(value),
@@ -8383,7 +8268,7 @@ impl<'a> FuncGen<'a> {
                     Size::S64,
                     Location::GPR(value),
                 );
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S16,
                         Location::GPR(value),
@@ -8411,7 +8296,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_mov(Size::S32, loc, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S32,
                         Location::GPR(value),
@@ -8443,7 +8328,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S32, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S32,
                         Location::GPR(value),
@@ -8475,7 +8360,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S64, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 8, |this, addr| {
+                self.memory_op(target, memarg, true, 8, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S64,
                         Location::GPR(value),
@@ -8509,7 +8394,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S8, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S8,
                         Location::GPR(value),
@@ -8543,7 +8428,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S16, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S16,
                         Location::GPR(value),
@@ -8577,7 +8462,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S8, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S8,
                         Location::GPR(value),
@@ -8611,7 +8496,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S16, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S16,
                         Location::GPR(value),
@@ -8643,7 +8528,7 @@ impl<'a> FuncGen<'a> {
                     .specific
                     .assembler
                     .emit_neg(Size::S32, Location::GPR(value));
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
+                self.memory_op(target, memarg, true, 2, |this, addr| {
                     this.machine.specific.assembler.emit_lock_xadd(
                         Size::S32,
                         Location::GPR(value),
@@ -9213,15 +9098,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S32,
-                        Size::S32,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 4, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S32, Size::S32, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9236,15 +9115,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 8, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S64,
-                        Size::S64,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 8, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S64, Size::S64, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9259,15 +9132,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S8,
-                        Size::S32,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 1, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S8, Size::S32, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9282,15 +9149,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S16,
-                        Size::S32,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 2, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S16, Size::S32, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9305,15 +9166,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S8,
-                        Size::S64,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 1, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S8, Size::S64, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9328,15 +9183,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 2, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S16,
-                        Size::S64,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 2, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S16, Size::S64, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9351,15 +9200,9 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_xchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
-                    this.machine.emit_atomic_xchg(
-                        Size::S32,
-                        Size::S64,
-                        false,
-                        loc,
-                        addr,
-                        ret,
-                    );
+                self.memory_op(target, memarg, true, 4, |this, addr| {
+                    this.machine
+                        .emit_atomic_xchg(Size::S32, Size::S64, false, loc, addr, ret);
                     Ok(())
                 })?;
                 self.machine.release_xchg_temp_gpr();
@@ -9375,7 +9218,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 4, |this, addr| {
+                self.memory_op(target, memarg, true, 4, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S32,
                         Size::S32,
@@ -9400,7 +9243,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 8, |this, addr| {
+                self.memory_op(target, memarg, true, 8, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S64,
                         Size::S64,
@@ -9425,7 +9268,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S32,
                         Size::S8,
@@ -9450,7 +9293,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S32,
                         Size::S16,
@@ -9475,7 +9318,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S64,
                         Size::S8,
@@ -9500,7 +9343,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S64,
                         Size::S16,
@@ -9525,7 +9368,7 @@ impl<'a> FuncGen<'a> {
                 self.value_stack.push(ret);
 
                 self.machine.reserve_cmpxchg_temp_gpr();
-                self.emit_memory_op(target, memarg, true, 1, |this, addr| {
+                self.memory_op(target, memarg, true, 1, |this, addr| {
                     this.machine.emit_atomic_cmpxchg(
                         Size::S64,
                         Size::S32,
