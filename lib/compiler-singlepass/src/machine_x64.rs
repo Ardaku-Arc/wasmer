@@ -992,7 +992,11 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
         self.emit_relaxed_zx_sx(Assembler::emit_movsx, sz_src, src, sz_dst, dst);
     }
 
-    fn move_with_reloc(&mut self, reloc_target: RelocationTarget, relocations: &mut Vec<Relocation>) {
+    fn move_with_reloc(
+        &mut self,
+        reloc_target: RelocationTarget,
+        relocations: &mut Vec<Relocation>,
+    ) {
         let reloc_at = self.assembler.get_offset().0 + self.assembler.arch_mov64_imm_offset();
 
         relocations.push(Relocation {

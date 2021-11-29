@@ -5780,7 +5780,9 @@ impl<'a> FuncGen<'a> {
                         function_index - self.module.num_imported_functions,
                     ))
                 };
-                self.machine.specific.move_with_reloc(reloc_target, &mut self.relocations);
+                self.machine
+                    .specific
+                    .move_with_reloc(reloc_target, &mut self.relocations);
 
                 self.emit_call_native(
                     |this| {
