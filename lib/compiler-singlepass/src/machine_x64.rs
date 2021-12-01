@@ -2812,7 +2812,18 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
             self.release_simd(tmp1);
         }
     }
-
+    fn f64_add(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vaddsd, loc_a, loc_b, ret);
+    }
+    fn f64_sub(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vsubsd, loc_a, loc_b, ret);
+    }
+    fn f64_mul(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vmulsd, loc_a, loc_b, ret);
+    }
+    fn f64_div(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vdivsd, loc_a, loc_b, ret);
+    }
     fn f32_neg(&mut self, loc: Location, ret: Location) {
         if self.assembler.arch_has_fneg() {
             let tmp = self.acquire_temp_simd().unwrap();
@@ -3269,6 +3280,19 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
             self.release_simd(tmp1);
         }
     }
+    fn f32_add(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vaddss, loc_a, loc_b, ret);
+    }
+    fn f32_sub(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vsubss, loc_a, loc_b, ret);
+    }
+    fn f32_mul(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vmulss, loc_a, loc_b, ret);
+    }
+    fn f32_div(&mut self, loc_a: Location, loc_b: Location, ret: Location) {
+        self.emit_relaxed_avx(Assembler::emit_vdivss, loc_a, loc_b, ret);
+    }
+
 }
 
 pub type Machine = AbstractMachine<GPR, XMM, MachineX86_64, X64Register>;
