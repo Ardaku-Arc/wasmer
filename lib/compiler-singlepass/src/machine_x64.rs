@@ -1467,15 +1467,13 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
     fn push_used_gpr(&mut self) {
         let used_gprs = self.get_used_gprs();
         for r in used_gprs.iter() {
-            self.assembler
-                .emit_push(Size::S64, Location::GPR(*r));
+            self.assembler.emit_push(Size::S64, Location::GPR(*r));
         }
     }
     fn pop_used_gpr(&mut self) {
         let used_gprs = self.get_used_gprs();
         for r in used_gprs.iter().rev() {
-            self.assembler
-                .emit_pop(Size::S64, Location::GPR(*r));
+            self.assembler.emit_pop(Size::S64, Location::GPR(*r));
         }
     }
 
@@ -1643,18 +1641,13 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
         match loc {
             Location::Imm64(_) => {
                 // Dummy value slot to be filled with `mov`.
-                self.assembler
-                    .emit_push(Size::S64, Location::GPR(GPR::RAX));
+                self.assembler.emit_push(Size::S64, Location::GPR(GPR::RAX));
 
                 // Use R9 as the temporary register here, since:
                 // - It is a temporary register that is not used for any persistent value.
                 // - This register as an argument location is only written to after `sort_call_movs`.'
                 self.reserve_unused_temp_gpr(GPR::R9);
-                self.move_location(
-                    Size::S64,
-                    loc,
-                    Location::GPR(GPR::R9),
-                );
+                self.move_location(Size::S64, loc, Location::GPR(GPR::R9));
                 self.move_location(
                     Size::S64,
                     Location::GPR(GPR::R9),
@@ -1664,15 +1657,10 @@ impl MachineSpecific<GPR, XMM> for MachineX86_64 {
             }
             Location::SIMD(_) => {
                 // Dummy value slot to be filled with `mov`.
-                self.assembler
-                    .emit_push(Size::S64, Location::GPR(GPR::RAX));
+                self.assembler.emit_push(Size::S64, Location::GPR(GPR::RAX));
 
                 // XMM registers can be directly stored to memory.
-                self.move_location(
-                    Size::S64,
-                    loc,
-                    Location::Memory(GPR::RSP, 0),
-                );
+                self.move_location(Size::S64, loc, Location::Memory(GPR::RSP, 0));
             }
             _ => self.assembler.emit_push(Size::S64, loc),
         }

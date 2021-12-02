@@ -480,7 +480,9 @@ impl<'a> FuncGen<'a> {
 
         // Restore stack.
         if stack_offset + stack_padding > 0 {
-            self.machine.specific.restore_stack((stack_offset + stack_padding) as u32);
+            self.machine
+                .specific
+                .restore_stack((stack_offset + stack_padding) as u32);
             if (stack_offset % 8) != 0 {
                 return Err(CodegenError {
                     message: "emit_call_native: Bad restoring stack alignement".to_string(),
@@ -519,10 +521,7 @@ impl<'a> FuncGen<'a> {
         label: DynamicLabel,
         params: I,
     ) -> Result<(), CodegenError> {
-        self.emit_call_native(
-            |this| this.machine.specific.emit_call_label(label),
-            params,
-        )?;
+        self.emit_call_native(|this| this.machine.specific.emit_call_label(label), params)?;
         Ok(())
     }
 
